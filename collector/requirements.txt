@@ -1,0 +1,2 @@
+pyirsdk
+kafka-python

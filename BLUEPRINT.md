@@ -94,47 +94,79 @@ Maximum-priority interruption rule: the buffer operates on a 1-second timer, **e
 
 ### 4.4 Stream Replay Pattern (Demo Isolation)
 
-For evaluation environments or technical interviews where the simulator is inaccessible, the producer implements an environment-variable-controlled logic switch. In replay mode, the script reads a pre-captured `.json` file from real on-track conditions and injects it sequentially into the Kafka topic at the same 10 Hz cadence — producing an **identical and indistinguishable replica** of the live flow for Grafana.
+For evaluation environments or technical interviews where the simulator is inaccessible, a **dedicated cross-platform Replayer component** (`replayer/replay.py`) reads a pre-captured CSV file (e.g., exported from Garage61 or a previous session) and injects it sequentially into the Kafka topic at the same 10 Hz cadence — producing an **identical and indistinguishable replica** of the live flow for Grafana. The Replayer is architecturally separated from the Collector: it has no dependency on `pyirsdk` or Windows, and can run on any machine with network access to Kafka (including the backend server itself).
 
 ---
 
 ## 5. Pipeline Architecture
 
 ```text
-       [ iRacing Sim ] (Windows RAM MMF 60Hz)          [ JSON Replay File ] (GitHub Storage)
-              │                                                │
-              └───────────────┬────────────────────────────────┘
-                              ▼
-               ┌───────────────────────────────┐
-               │ INGESTION LAYER (PRODUCER)    │
-               │ Python Daemon + pyirsdk       │ <── Controlled by Environment:
-               │ - PIPELINE_MODE=LIVE          │     [LIVE / REPLAY]
-               │ - PIPELINE_MODE=REPLAY        │
-               └──────────────┬────────────────┘
-                              │
-                              ▼ (JSON Bulk Arrays / 1 Second)
-               ┌───────────────────────────────┐
-               │ STREAMING LAYER               │
-               │ Apache Kafka (KRaft Mode)     │
-               └──────────────┬────────────────┘
-                              │
-                              ▼ (Event Consumption)
-               ┌───────────────────────────────┐
-               │ PROCESSING LAYER (CONSUMER)   │
-               │ Python Stream Writer          │ <── Batch Processing Line (Airflow DAG)
-               └──────────────┬────────────────┘     [ Web REST API → MinIO S3 → dbt ]
-                              │                                       │
-                              ▼                                       ▼
+  MACHINE A — Windows (iRacing Host)
+  ════════════════════════════════════════════════════════════════
+
+       [ iRacing Sim ] (Windows RAM MMF 60Hz)
+              │
+              ▼
+       ┌───────────────────────────────┐
+       │ COLLECTOR (LIVE ONLY)         │
+       │ iRacingCollector.exe          │ ◄── Standalone Windows Executable
+       │ config.ini → Kafka IP         │     (PyInstaller packaged)
+       └──────────────┬────────────────┘
+                      │
+                      ▼ (JSON Bulk Arrays / 1 Second)
+              ┌───────────────┐
+              │   LAN / WiFi  │
+              └───────┬───────┘
+
+  ANY MACHINE (Windows, Linux, Mac)             MACHINE B — Linux (Backend & Analytics Server)
+  ═════════════════════════════════════════     ════════════════════════════════════════════════════════════════════
+
+  [ CSV Telemetry File ]                                        │
+         │                                                      │
+         ▼                                                      ▼
+  ┌───────────────────────────────────┐             ┌───────────────────────────────┐
+  │ REPLAYER (Cross-Platform)         │             │ STREAMING LAYER               │
+  │ replay.py                         │             │ Apache Kafka (KRaft Mode)     │
+  │ - Reads CSV (Garage61, etc.)      │ ─── LAN ──▶ └──────────────┬────────────────┘
+  │ - Emits at 10Hz cadence           │                            │
+  └───────────────────────────────────┘                            │
+                                                                   ▼ (Event Consumption)
+                                        ┌───────────────────────────────┐
+                                        │ PROCESSING LAYER (CONSUMER)   │
+                                        │ Python Stream Writer          │ ◄── Batch Processing Line (Airflow DAG)
+                                        └──────────────┬────────────────┘     [ Web REST API → MinIO S3 → dbt ]
+                                                       │                                       │
+                                                       ▼                                       ▼
 ┌───────────────────────────────────────────────────────────────────────────────┐
 │ STORAGE & ANALYTICAL MODELLING LAYER                                          │
 │ PostgreSQL + TimescaleDB (TSDB Hypertables & OLAP Dimensional Star Schema)    │
+│                                                                               │
+│   telemetry_logs  ◄── Live / Replay stream data                               │
+│   reference_laps  ◄── External CSV telemetry imports                          │
 └─────────────────────────────┬─────────────────────────────────────────────────┘
                               │
                               ▼ (High Frequency Clean SQL Queries)
-               ┌───────────────────────────────┐
-               │ VISUALISATION LAYER            │
-               │ Grafana Enterprise Dashboards │
-               └───────────────────────────────┘
+               ┌───────────────────────────────────────────────┐
+               │ VISUALISATION LAYER — Grafana Dashboards      │
+               │                                               │
+               │  ┌───────────────────┐ ┌────────────────────┐ │
+               │  │ Mode 1:           │ │ Mode 2:            │ │
+               │  │ Lap Consistency   │ │ Reference Lap      │ │
+               │  │ Analysis          │ │ Comparison         │ │
+               │  └───────────────────┘ └────────────────────┘ │
+               └───────────────────────────────────────────────┘
+
+  CSV INGESTION PATH (On-demand, Machine B)
+  ──────────────────────────────────────────
+       [ Garage61 CSV / External Telemetry ]
+                      │
+                      ▼
+        ┌──────────────────────────────┐
+        │ tools/csv_importer.py        │
+        │ - Parses & normalises CSV    │
+        │ - Aligns to LapDistPct       │
+        │ - Inserts into reference_laps│
+        └──────────────────────────────┘
 ```
 
 ### Technology Stack
@@ -151,6 +183,9 @@ For evaluation environments or technical interviews where the simulator is inacc
 | Transformation | **dbt (Data Build Tool)** | Analytical engineering layer (the T in ELT) — modular, parameterised SQL to build the final dimensional warehouse |
 | Visualisation | **Grafana** | Dynamic dashboard engine; executes optimised analytical reads against TimescaleDB Hypertables |
 | Infrastructure | **Docker & Docker Compose** | OS-level isolation and virtualisation; packages the entire topology for single-command deployment (`docker-compose up`) |
+| Packaging | **PyInstaller** | Compiles the Python collector script into a standalone Windows `.exe` executable — no Python installation required on the host |
+| Configuration | **config.ini** | External configuration file for runtime settings (Kafka broker IP, pipeline mode). Allows manual network setup without modifying source code |
+| CSV Processing | **pandas / numpy** | Parsing, normalisation, and spatial interpolation of external CSV telemetry files for the reference lap comparison system |
 
 ---
 
@@ -164,6 +199,12 @@ For evaluation environments or technical interviews where the simulator is inacc
 | `Lap` | Integer | Current lap number identifier |
 | `LapLastLapTime` | Float | Chronometric time of the last completed lap |
 
+**KPI — Consistency Index (per stint):**
+
+$$\sigma_{\text{stint}} = \sqrt{\frac{1}{N-1} \sum_{i=1}^{N} (t_i - \bar{t})^2}$$
+
+Where $t_i$ is the lap time of lap $i$ and $\bar{t}$ is the mean lap time across the stint. A lower $\sigma$ indicates higher consistency. This metric is tracked per stint to account for tyre degradation resets after pit stops.
+
 ### B. Fuel Management (Real-Time Analytics)
 
 | Variable | Type | Description |
@@ -171,6 +212,16 @@ For evaluation environments or technical interviews where the simulator is inacc
 | `FuelLevel` | Float | Volumetric fuel available in the tank (litres) |
 | `Fuel_Burned_Last_Lap` | Computed | $\text{FuelLevel}_{\text{Lap } N-1} - \text{FuelLevel}_{\text{Lap } N}$ |
 | **Projected Lap Autonomy** | KPI | $\frac{\text{FuelLevel}}{\text{Fuel\_Burned\_Last\_Lap}}$ |
+
+**Enhanced KPI — Moving Average Fuel Prediction:**
+
+$$\text{Avg Consumption} = \frac{1}{N} \sum_{i=0}^{N-1} \text{Fuel\_Burned}_{(\text{Lap } K-i)}$$
+
+$$\text{Laps Remaining} = \frac{\text{FuelLevel}}{\text{Avg Consumption}}$$
+
+$$\text{Fuel To Add In Pits} = (\text{Laps Target} - \text{Laps Remaining}) \times \text{Avg Consumption}$$
+
+Where $N$ is the rolling window size (default: 3 laps). Using a moving average instead of a single-lap snapshot smooths out anomalies (safety car laps, off-track incidents) and produces a more stable and reliable pit-stop fuel strategy.
 
 ### C. Tyre & Chassis Diagnostics (Understeer / Oversteer)
 
@@ -191,6 +242,14 @@ $$\Delta T = \text{Avg}(T_{\text{front}}) - \text{Avg}(T_{\text{rear}})$$
 | **Understeer** | $\Delta T \gg 0$ sustained during mid-corner load + extreme `SteeringWheelAngle` + open `Throttle` | Front tyres scrub excessively; car pushes wide |
 | **Oversteer** | $\Delta T \ll 0$ with abrupt localised rear-tyre friction spikes + severe yaw acceleration deviations | Rear traction loss; car rotates beyond driver intent |
 
+### D. Spatial Alignment & Reference Comparison
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `LapDistPct` | Float | Percentage of the current lap distance completed (0.0 – 1.0). Provided natively by iRacing shared memory. Used as the primary alignment axis for all lap-overlay visualisations |
+
+This variable replaces time as the X-axis when overlaying telemetry curves. Two laps with different absolute times can be compared metre-by-metre using `LapDistPct`, enabling both internal consistency analysis and external reference comparison.
+
 ---
 
 ## 7. Repository Structure
@@ -201,11 +260,19 @@ iracing-telemetry-pipeline/
 ├── README.md                      # Portfolio-facing documentation with architecture diagrams
 ├── BLUEPRINT.md                   # This file — single source of truth for design & specs
 ├── docker-compose.yml             # Centralised deployment: Kafka, TimescaleDB, MinIO, Airflow, Grafana
-├── collector/                     # Ingestion & Extraction Module (Native Windows Environment)
+├── collector/                     # Live Telemetry Capture (Native Windows Environment — LIVE only)
 │   ├── requirements.txt           # Dependencies (pyirsdk, kafka-python)
-│   ├── main_collector.py          # Collector script with Downsampling, Micro-batch & Replay Switcher
-│   └── sample_data/               # Static datasets recorded from real on-track sessions
-│       └── recorded_race_5laps.json
+│   ├── config.ini                 # External runtime configuration (Kafka IP, topic)
+│   ├── main_collector.py          # Live collector with Downsampling, Micro-batch & Deadband
+│   └── build_exe.bat              # PyInstaller build script for generating iRacingCollector.exe
+├── replayer/                      # Telemetry Replay Component (Cross-Platform — CSV input)
+│   ├── requirements.txt           # Dependencies (kafka-python, pandas)
+│   ├── config.ini                 # Kafka connection & replay parameters (CSV path, sample rate)
+│   ├── replay.py                  # CSV-based telemetry replayer with Micro-batch & Deadband
+│   └── sample_data/               # Demo datasets for replay without simulator
+│       └── sample_race_5laps.csv
+├── tools/                         # Auxiliary Utilities
+│   └── csv_importer.py            # CLI script to parse, normalise and ingest external CSV telemetry into reference_laps
 ├── consumer/                      # Consumer & Loading Layer (Dockerised Linux Container)
 │   ├── Dockerfile
 │   ├── requirements.txt           # Dependencies (kafka-python, psycopg2-binary)
@@ -247,6 +314,28 @@ SELECT create_hypertable('telemetry_logs', 'time');
 
 -- Composite index to accelerate per-lap analytical queries
 CREATE INDEX ix_telemetry_lap_analysis ON telemetry_logs (lap_number, time DESC);
+
+-- Add spatial alignment column for lap overlay analysis
+ALTER TABLE telemetry_logs ADD COLUMN IF NOT EXISTS lap_dist_pct NUMERIC;
+
+-- Reference laps table for external CSV telemetry imports
+CREATE TABLE IF NOT EXISTS reference_laps (
+    reference_id   TEXT NOT NULL,          -- Unique identifier ("quali_best_spa", "pro_driver_monza")
+    lap_dist_pct   NUMERIC NOT NULL,       -- Normalised lap distance (0.0 – 1.0)
+    speed          NUMERIC,
+    throttle       NUMERIC,
+    brake          NUMERIC,
+    steering_angle NUMERIC,
+    fuel_level     NUMERIC,
+    temp_lf        NUMERIC,
+    temp_rf        NUMERIC,
+    temp_lr        NUMERIC,
+    temp_rr        NUMERIC,
+    PRIMARY KEY (reference_id, lap_dist_pct)
+);
+
+-- Index for fast reference lap lookups
+CREATE INDEX IF NOT EXISTS ix_reference_lap_id ON reference_laps (reference_id);
 ```
 
 ---
@@ -260,70 +349,104 @@ CREATE INDEX ix_telemetry_lap_analysis ON telemetry_logs (lap_number, time DESC)
 3. Deploy the physical schema via `db/init.sql` (see Section 8 above).
 4. Validate that all services start correctly with `docker-compose up` and basic health checks.
 
-### Phase 2: Multi-Purpose Producer (Collector Script)
+### Phase 2A: Live Collector (Windows Native)
 
-Build the modularised capture logic in `main_collector.py` with the environment-driven mode switch:
+Build the dedicated live capture component in `collector/main_collector.py`. This component **only** operates in live mode — it has a single responsibility: read iRacing shared memory and transmit to Kafka.
 
 ```python
 import json
-import os
 import time
+import configparser
+from kafka import KafkaProducer
+import irsdk
+
+
+def live_generator():
+    ir = irsdk.IRSDK()
+    ir.startup()
+    prev_lap = 0
+    frame_counter = 0
+    while True:
+        if ir.is_connected():
+            frame_counter += 1
+            if frame_counter % 6 != 0:  # Downsampling 60Hz → 10Hz
+                time.sleep(1 / 60)
+                continue
+            current_lap = ir['Lap']
+            payload = {
+                'session_time': ir['SessionTime'],
+                'lap': current_lap,
+                'fuel': ir['FuelLevel'],
+                'steering': ir['SteeringWheelAngle'],
+                'throttle': ir['Throttle'],
+                'brake': ir['Brake'],
+                'temp_lf': ir['LFtempCL'],
+                'temp_rf': ir['RFtempCL'],
+                'temp_lr': ir['LRtempCL'],
+                'temp_rr': ir['RRtempCL'],
+                'lap_dist_pct': ir['LapDistPct'],
+            }
+            # Event-Driven Deadband: immediate flush on lap change
+            if current_lap > prev_lap:
+                payload['lap_time'] = ir['LapLastLapTime']
+                payload['lap_crossed'] = True
+                prev_lap = current_lap
+            yield payload
+        time.sleep(1 / 60)
+```
+
+1. Implement an external `config.ini` configuration file for runtime parameters:
+   - `bootstrap_server`: IP and port of the Kafka broker on the backend machine (e.g., `192.168.1.50:9092`).
+   - `topic`: Kafka topic name.
+2. Implement `KafkaBufferedProducer` class with micro-batching (buffer of 10 samples) and event-driven deadband (immediate flush on lap crossing).
+3. Add `LapDistPct` to the captured telemetry payload for spatial alignment in downstream analysis.
+4. Package the collector as a standalone Windows executable using **PyInstaller** (`--onefile` mode), bundling `pyirsdk`, `kafka-python`, and the default `config.ini`.
+5. Validate that `iRacingCollector.exe` can produce messages to a remote Kafka broker across the local network.
+
+### Phase 2B: Telemetry Replayer (Cross-Platform)
+
+Build the dedicated replay component in `replayer/replay.py`. This component is **independent from the Collector** — it has no dependency on `pyirsdk` or Windows and can run on any machine (including the backend server itself).
+
+```python
+import json
+import time
+import csv
+import configparser
 from kafka import KafkaProducer
 
-PIPELINE_MODE = os.getenv('PIPELINE_MODE', 'LIVE')
-producer = KafkaProducer(
-    bootstrap_servers=['localhost:9092'],
-    value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-)
 
-
-def stream_generator():
-    if PIPELINE_MODE == 'LIVE':
-        import irsdk
-
-        ir = irsdk.IRSDK()
-        ir.startup()
+def csv_replay_generator(csv_path, sample_rate_hz=10):
+    with open(csv_path, 'r') as f:
+        reader = csv.DictReader(f)
         prev_lap = 0
-        while True:
-            if ir.is_connected():
-                current_lap = ir['Lap']
-                payload = {
-                    'session_time': ir['SessionTime'],
-                    'lap': current_lap,
-                    'fuel': ir['FuelLevel'],
-                    'steering': ir['SteeringWheelAngle'],
-                    'throttle': ir['Throttle'],
-                    'brake': ir['Brake'],
-                    'temp_lf': ir['LFtempCL'],
-                    'temp_rf': ir['RFtempCL'],
-                    'temp_lr': ir['LRtempCL'],
-                    'temp_rr': ir['RRtempCL'],
-                }
-                # Event-Driven Deadband: immediate flush on lap change
-                if current_lap > prev_lap:
-                    payload['lap_time'] = ir['LapLastLapTime']
-                    payload['lap_crossed'] = True
-                    prev_lap = current_lap
-                yield payload
-            time.sleep(0.1)  # Downsampling to 10 Hz
-    else:
-        # REPLAY MODE: Pre-recorded telemetry, no simulator dependency
-        with open('sample_data/recorded_race_5laps.json', 'r') as f:
-            mock_data = json.load(f)
-        for data_point in mock_data:
-            yield data_point
-            time.sleep(0.1)  # Exact 10 Hz streaming cadence
-
-
-buffer = []
-for payload in stream_generator():
-    buffer.append(payload)
-    # Flush on lap crossing (Deadband) or when 1-second buffer is full
-    lap_crossed = payload.get('lap_crossed', False)
-    if lap_crossed or len(buffer) >= 10:
-        producer.send('iracing-live-telemetry', value=buffer)
-        buffer = []
+        for row in reader:
+            payload = {
+                'session_time': float(row['session_time']),
+                'lap': int(row['lap']),
+                'fuel': float(row['fuel']),
+                'steering': float(row['steering']),
+                'throttle': float(row['throttle']),
+                'brake': float(row['brake']),
+                'temp_lf': float(row['temp_lf']),
+                'temp_rf': float(row['temp_rf']),
+                'temp_lr': float(row['temp_lr']),
+                'temp_rr': float(row['temp_rr']),
+                'lap_dist_pct': float(row['lap_dist_pct']),
+            }
+            current_lap = payload['lap']
+            if current_lap > prev_lap:
+                payload['lap_time'] = float(row.get('lap_time', 0))
+                payload['lap_crossed'] = True
+                prev_lap = current_lap
+            yield payload
+            time.sleep(1 / sample_rate_hz)
 ```
+
+1. Implement `config.ini` for Kafka connection and replay parameters (CSV file path, sample rate).
+2. Reuse the same `KafkaBufferedProducer` pattern (micro-batching + deadband) to produce to the **same Kafka topic** as the Collector.
+3. Accept CSV files as input — compatible with Garage61 exports and any standard telemetry CSV format.
+4. Include `sample_data/sample_race_5laps.csv` as a bundled demo dataset.
+5. Validate that the Replayer produces an indistinguishable stream from the Collector when consumed by the downstream pipeline.
 
 ### Phase 3: Stream Consumer & Distributed Loading
 
@@ -338,10 +461,26 @@ for payload in stream_generator():
 2. **dbt Models**:
    - `staging/`: Cleanse and index raw JSON objects from MinIO into normalised relational tables.
    - `marts/`: Build the final **Star Schema** with fact tables (`fact_telemetry_logs`, `fact_lap_summaries`) and dimension tables (`dim_drivers`, `dim_tracks`, `dim_cars`).
-3. **Grafana Dashboards**:
-   - **Live Dashboard**: Gauge panels for current fuel level, projected remaining laps, and a bar chart of last lap time.
-   - **Post-Race Dashboard**: Scatter plot pairing `SteeringWheelAngle` against the tyre temperature differential ($\Delta T$) to visually map which sectors/corners generate understeer.
-4. Connect Grafana to TimescaleDB/PostgreSQL as the official data source.
+3. **Analysis Mode 1 — Lap Consistency Dashboard**:
+   - Line chart overlaying throttle, brake, and steering curves of multiple laps (filtered by `lap_number`) aligned on the `LapDistPct` axis.
+   - Lap time bar chart with the stint mean displayed as a reference line.
+   - Consistency Index gauge ($\sigma$ per stint) showing how stable the driver's pace is.
+   - Degradation trend line plotting lap time evolution across a full stint to visualise tyre drop-off.
+4. **Analysis Mode 2 — Reference Lap Comparison Dashboard**:
+   - Dropdown selector to choose a `reference_id` from the `reference_laps` table.
+   - Dual-line overlay comparing the driver's selected lap against the reference lap, aligned by `LapDistPct`.
+   - Speed delta chart ($\Delta V = V_{\text{driver}} - V_{\text{reference}}$) highlighting braking zones where the driver loses or gains time.
+   - Cumulative time delta curve showing progressive gain/loss across the lap.
+5. **CSV Ingestion Tooling**:
+   - Develop `tools/csv_importer.py` — a CLI utility that parses external CSV files (e.g., Garage61 exports), normalises column names, interpolates to a uniform `LapDistPct` grid using numpy, and bulk-inserts into the `reference_laps` table.
+6. Connect Grafana to TimescaleDB/PostgreSQL as the official data source.
+
+### Phase 5: Data Lifecycle & Retention Policies
+
+1. Configure **TimescaleDB Continuous Aggregates** to automatically materialise downsampled summaries (e.g., per-minute averages) from the high-frequency 10 Hz telemetry data.
+2. Implement **retention policies** using TimescaleDB's `add_retention_policy` to automatically drop raw 10 Hz chunks older than a configurable threshold (e.g., 30 days).
+3. Configure an export job to archive aged raw data to **MinIO** in **Parquet** format before deletion, ensuring long-term cold storage availability.
+4. Document the full data lifecycle: hot (real-time queries) → warm (continuous aggregates) → cold (Parquet in MinIO/S3).
 
 ---
 
@@ -357,6 +496,8 @@ These are stretch goals for expanding the project beyond v1:
 | **Pipeline Observability** | Monitor pipeline health metrics (consumer lag, buffer overflows, DB write latency) alongside the business dashboards. |
 | **Security Hardening** | Kafka SASL/SCRAM authentication, secrets management for DB credentials, Grafana auth configuration. |
 | **Automated Testing** | Unit tests for the producer/consumer, integration tests using Replay mode, and dbt data validation tests in CI. |
+| **Intermediate Stream Processor** | Introduce a lightweight Python stream processor (e.g., **Faust**) between the Kafka raw topic and the consumer. This layer would emit processed analytical events (e.g., `lap-completed`, `pit-stop-detected`) into secondary Kafka topics, decoupling raw ingestion from business-event generation. |
+| **Auto-Discovery Configuration** | Replace the manual `config.ini` IP setup with an auto-discovery mechanism (e.g., mDNS/Bonjour or a simple broadcast UDP handshake) so the Windows collector automatically finds the backend server on the local network. |
 
 ---
 
