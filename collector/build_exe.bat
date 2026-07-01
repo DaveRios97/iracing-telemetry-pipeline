@@ -14,7 +14,7 @@ pip install pyinstaller
 echo.
 echo Compilando ejecutable...
 pyinstaller --onefile ^
-    --hidden-import=kafka ^
+    --collect-all kafka ^
     --name iRacingCollector ^
     main_collector.py
 
