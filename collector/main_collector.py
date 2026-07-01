@@ -134,7 +134,7 @@ def live_generator():
     print("[LIVE] Waiting for iRacing connection...")
     
     while True:
-        if ir.is_connected():
+        if ir.is_connected:
             frame_counter += 1
             
             # Downsampling: iRacing updates at 60Hz. 
